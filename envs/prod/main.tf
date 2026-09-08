@@ -1,53 +1,75 @@
 terraform {
-  required_version = ">= 1.14"
+  required_version = ">= 1.15.8"
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 6.0"
+      version = "~> 5.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.6"
     }
   }
 }
 
 provider "aws" {
-  region = "eu-west-3"
+  region = var.aws_region
   default_tags {
     tags = {
+      Project     = "NovaSphere"
       Environment = var.environment
       Owner       = var.owner
-      Project     = "NovaSphere"
+      ManagedBy   = "Terraform"
     }
   }
 }
 
-data "aws_ami" "debian" {
+provider "random" {}
+
+resource "random_string" "suffix" {
+  length  = 6
+  special = false
+  upper   = false
+}
+
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+data "aws_ami" "ubuntu" {
   most_recent = true
-  owners      = ["136540187036"]
   filter {
     name   = "name"
-    values = ["debian-12-amd64-*"]
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
   }
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+  owners = ["099720109477"]
 }
 
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "~> 6.0"
 
-  name = "novasphere-${var.environment}"
+  name = "novasphere-${var.environment}-vpc"
   cidr = "10.0.0.0/16"
 
-  azs            = ["eu-west-3a", "eu-west-3b"]
+  azs            = slice(data.aws_availability_zones.available.names, 0, 2)
   public_subnets = ["10.0.1.0/24", "10.0.2.0/24"]
 
-  enable_nat_gateway      = false
-  enable_vpn_gateway      = false
-  map_public_ip_on_launch = true
+  enable_nat_gateway = false
+  enable_vpn_gateway = false
 }
 
 resource "aws_security_group" "alb" {
-  name   = "novasphere-${var.environment}-alb"
-  vpc_id = module.vpc.vpc_id
+  name        = "novasphere-${var.environment}-alb-sg"
+  description = "Autorise le trafic HTTP entrant pour ALB"
+  vpc_id      = module.vpc.vpc_id
 
   ingress {
+    description = "HTTP depuis Internet"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
@@ -55,6 +77,7 @@ resource "aws_security_group" "alb" {
   }
 
   egress {
+    description = "Tout trafic sortant"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
@@ -62,11 +85,13 @@ resource "aws_security_group" "alb" {
   }
 }
 
-resource "aws_security_group" "web" {
-  name   = "novasphere-${var.environment}-web"
-  vpc_id = module.vpc.vpc_id
+resource "aws_security_group" "instance" {
+  name        = "novasphere-${var.environment}-instance-sg"
+  description = "Autorise le trafic venant uniquement de ALB"
+  vpc_id      = module.vpc.vpc_id
 
   ingress {
+    description     = "HTTP uniquement depuis ALB"
     from_port       = 80
     to_port         = 80
     protocol        = "tcp"
@@ -74,6 +99,7 @@ resource "aws_security_group" "web" {
   }
 
   egress {
+    description = "Tout trafic sortant"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
@@ -81,120 +107,131 @@ resource "aws_security_group" "web" {
   }
 }
 
-resource "aws_launch_template" "web" {
-  name_prefix   = "novasphere-${var.environment}-"
-  image_id      = data.aws_ami.debian.id
+resource "aws_iam_role" "ec2_role" {
+  name = "novasphere-${var.environment}-ec2-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+    }]
+  })
+}
+
+resource "aws_iam_policy" "ssm_read" {
+  name        = "novasphere-${var.environment}-ssm-read"
+  description = "Lecture stricte des secrets Parameter Store pour ${var.environment}"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "ssm:GetParameter",
+        "ssm:GetParameters",
+        "ssm:GetParametersByPath"
+      ]
+      Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/novasphere/${var.environment}/*"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ssm_attach" {
+  role       = aws_iam_role.ec2_role.name
+  policy_arn = aws_iam_policy.ssm_read.arn
+}
+
+resource "aws_iam_instance_profile" "ec2_profile" {
+  name = "novasphere-${var.environment}-instance-profile"
+  role = aws_iam_role.ec2_role.name
+}
+
+variable "db_password" {
+  type      = string
+  sensitive = true
+  ephemeral = true
+  default   = "SecretInitProd2026!"
+}
+
+resource "aws_ssm_parameter" "db_password" {
+  name        = "/novasphere/${var.environment}/db_password"
+  type        = "SecureString"
+  value_wo    = var.db_password
+  description = "Mot de passe applicatif"
+}
+
+resource "aws_launch_template" "app" {
+  name_prefix   = "novasphere-${var.environment}-lt-"
+  image_id      = data.aws_ami.ubuntu.id
   instance_type = var.instance_type
 
-  vpc_security_group_ids = [aws_security_group.web.id]
-  user_data              = base64encode(file("${path.module}/bootstrap.sh"))
+  iam_instance_profile {
+    name = aws_iam_instance_profile.ec2_profile.name
+  }
+
+  vpc_security_group_ids = [aws_security_group.instance.id]
+
+  user_data = filebase64("${path.module}/bootstrap.sh")
 
   tag_specifications {
     resource_type = "instance"
     tags = {
-      Name = "novasphere-${var.environment}-web"
+      Name = "novasphere-${var.environment}-asg-instance"
     }
   }
 }
 
-resource "aws_lb" "web" {
-  name               = "novasphere-${var.environment}"
-  load_balancer_type = "application"
-  subnets            = module.vpc.public_subnets
-  security_groups    = [aws_security_group.alb.id]
-}
-
-resource "aws_lb_target_group" "web" {
-  name     = "novasphere-${var.environment}-web"
+resource "aws_lb_target_group" "app" {
+  name     = "novasphere-${var.environment}-tg"
   port     = 80
   protocol = "HTTP"
   vpc_id   = module.vpc.vpc_id
 
   health_check {
-    path    = "/"
-    matcher = "200"
+    path                = "/"
+    protocol            = "HTTP"
+    matcher             = "200"
+    interval            = 30
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
   }
 }
 
+resource "aws_lb" "main" {
+  name               = "novasphere-${var.environment}-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = module.vpc.public_subnets
+}
+
 resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.web.arn
+  load_balancer_arn = aws_lb.main.arn
   port              = 80
   protocol          = "HTTP"
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.web.arn
+    target_group_arn = aws_lb_target_group.app.arn
   }
 }
 
-resource "aws_autoscaling_group" "web" {
-  name                = "novasphere-${var.environment}-web"
-  min_size            = 2
-  max_size            = 4
-  desired_capacity    = 2
+resource "aws_autoscaling_group" "app" {
+  name_prefix         = "novasphere-${var.environment}-asg-"
   vpc_zone_identifier = module.vpc.public_subnets
-  target_group_arns   = [aws_lb_target_group.web.arn]
-  health_check_type   = "ELB"
+  target_group_arns   = [aws_lb_target_group.app.arn]
+
+  min_size     = 2
+  max_size     = 4
+  desired_capacity = 2
 
   launch_template {
-    id      = aws_launch_template.web.id
+    id      = aws_launch_template.app.id
     version = "$Latest"
   }
-
-  tag {
-    key                 = "Name"
-    value               = "novasphere-${var.environment}-web"
-    propagate_at_launch = true
-  }
-}
-
-output "alb_dns_name" {
-  value = aws_lb.web.dns_name
-}
-
-variable "db_password" {
-  description = "Mot de passe applicatif"
-  type        = string
-  ephemeral   = true
-  default     = "TemporaryPass123!"
-}
-
-resource "aws_ssm_parameter" "db_password" {
-  name             = "/novasphere/${var.environment}/db_password"
-  type             = "SecureString"
-  value_wo         = var.db_password
-  value_wo_version = 1
-}
-
-data "aws_iam_policy_document" "ec2_assume" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["ec2.amazonaws.com"]
-    }
-  }
-}
-
-resource "aws_iam_role" "web" {
-  name               = "novasphere-${var.environment}-web"
-  assume_role_policy = data.aws_iam_policy_document.ec2_assume.json
-}
-
-resource "aws_iam_role_policy" "read_secrets" {
-  name = "read-secrets"
-  role = aws_iam_role.web.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = ["ssm:GetParameter"]
-      Resource = "arn:aws:ssm:eu-west-3:*:parameter/novasphere/${var.environment}/*"
-    }]
-  })
-}
-
-resource "aws_iam_instance_profile" "web" {
-  name = "novasphere-${var.environment}-web"
-  role = aws_iam_role.web.name
 }
