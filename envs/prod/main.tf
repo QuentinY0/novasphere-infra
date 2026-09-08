@@ -51,7 +51,7 @@ data "aws_ami" "ubuntu" {
 
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
-  version = "~> 6.0"
+  version = "~> 5.0"
 
   name = "novasphere-${var.environment}-vpc"
   cidr = "10.0.0.0/16"
@@ -226,8 +226,8 @@ resource "aws_autoscaling_group" "app" {
   vpc_zone_identifier = module.vpc.public_subnets
   target_group_arns   = [aws_lb_target_group.app.arn]
 
-  min_size     = 2
-  max_size     = 4
+  min_size         = 2
+  max_size         = 4
   desired_capacity = 2
 
   launch_template {
