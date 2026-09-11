@@ -56,8 +56,9 @@ module "vpc" {
   name = "novasphere-${var.environment}-vpc"
   cidr = "10.0.0.0/16"
 
-  azs            = slice(data.aws_availability_zones.available.names, 0, 2)
-  public_subnets = ["10.0.1.0/24", "10.0.2.0/24"]
+  azs                     = slice(data.aws_availability_zones.available.names, 0, 2)
+  public_subnets          = ["10.0.1.0/24", "10.0.2.0/24"]
+  map_public_ip_on_launch = true
 
   enable_nat_gateway = false
   enable_vpn_gateway = false
@@ -107,49 +108,6 @@ resource "aws_security_group" "instance" {
   }
 }
 
-resource "aws_iam_role" "ec2_role" {
-  name = "novasphere-${var.environment}-ec2-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
-      Principal = {
-        Service = "ec2.amazonaws.com"
-      }
-    }]
-  })
-}
-
-resource "aws_iam_policy" "ssm_read" {
-  name        = "novasphere-${var.environment}-ssm-read"
-  description = "Lecture stricte des secrets Parameter Store pour ${var.environment}"
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = [
-        "ssm:GetParameter",
-        "ssm:GetParameters",
-        "ssm:GetParametersByPath"
-      ]
-      Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/novasphere/${var.environment}/*"
-    }]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "ssm_attach" {
-  role       = aws_iam_role.ec2_role.name
-  policy_arn = aws_iam_policy.ssm_read.arn
-}
-
-resource "aws_iam_instance_profile" "ec2_profile" {
-  name = "novasphere-${var.environment}-instance-profile"
-  role = aws_iam_role.ec2_role.name
-}
-
 variable "db_password" {
   type      = string
   sensitive = true
@@ -158,10 +116,11 @@ variable "db_password" {
 }
 
 resource "aws_ssm_parameter" "db_password" {
-  name        = "/novasphere/${var.environment}/db_password"
-  type        = "SecureString"
-  value_wo    = var.db_password
-  description = "Mot de passe applicatif"
+  name             = "/novasphere/${var.environment}/db_password"
+  type             = "SecureString"
+  value_wo         = var.db_password
+  value_wo_version = 1
+  description      = "Mot de passe applicatif"
 }
 
 resource "aws_launch_template" "app" {
@@ -170,10 +129,13 @@ resource "aws_launch_template" "app" {
   instance_type = var.instance_type
 
   iam_instance_profile {
-    name = aws_iam_instance_profile.ec2_profile.name
+    name = "LabInstanceProfile"
   }
 
-  vpc_security_group_ids = [aws_security_group.instance.id]
+  network_interfaces {
+    associate_public_ip_address = true
+    security_groups             = [aws_security_group.instance.id]
+  }
 
   user_data = filebase64("${path.module}/bootstrap.sh")
 
